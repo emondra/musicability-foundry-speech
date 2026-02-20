@@ -1,4 +1,22 @@
-.venv/
-__pycache__/
+# Secretos — NUNCA subir al repo
 .env
-*.pyc
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Archivos generados
+*.mid
+
+# IDEs
+.vscode/
+.idea/
