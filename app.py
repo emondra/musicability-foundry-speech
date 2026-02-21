@@ -9,6 +9,7 @@ import os
 import re
 import struct
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -24,6 +25,12 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 FOUNDRY_API_KEY  = os.getenv("FOUNDRY_API_KEY", "")
 FOUNDRY_ENDPOINT = os.getenv("FOUNDRY_ENDPOINT", "").rstrip("/")
 MODEL_DEPLOYMENT = os.getenv("MODEL_DEPLOYMENT_NAME", "")
+# MODEL_NAME: nombre base del modelo (ej. gpt-5-nano). Si no se define,
+# se usa MODEL_DEPLOYMENT_NAME como fallback.
+MODEL_NAME       = os.getenv("MODEL_NAME", "") or MODEL_DEPLOYMENT
+# Para endpoints services.ai.azure.com/api/projects/... usar 2024-05-01-preview
+# Para endpoints clásicos *.openai.azure.com usar 2024-10-21
+FOUNDRY_API_VERSION = os.getenv("FOUNDRY_API_VERSION", "2024-05-01-preview")
 
 # Campos mínimos que el JSON del modelo debe contener
 REQUIRED_FIELDS = {"title", "tempo_bpm", "key", "length_bars",
@@ -99,28 +106,40 @@ def call_foundry_for_music_json(user_text: str) -> dict:
             "MODEL_DEPLOYMENT_NAME no están configuradas."
         )
 
-    url = (
-        f"{FOUNDRY_ENDPOINT}"
-        f"/openai/deployments/{MODEL_DEPLOYMENT}"
-        f"/chat/completions?api-version=2024-10-21"
-    )
+    # Construir URL correcta según tipo de endpoint:
+    # - services.ai.azure.com  → /models/chat/completions  (AI Foundry Inference)
+    # - openai.azure.com       → /openai/deployments/{model}/chat/completions
+    parsed = urlparse(FOUNDRY_ENDPOINT)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    if "openai.azure.com" in parsed.netloc:
+        url = (
+            f"{base}"
+            f"/openai/deployments/{MODEL_DEPLOYMENT}"
+            f"/chat/completions?api-version={FOUNDRY_API_VERSION}"
+        )
+    else:
+        # Endpoint AI Foundry (services.ai.azure.com)
+        url = f"{base}/models/chat/completions?api-version={FOUNDRY_API_VERSION}"
+
     headers = {
         "Content-Type": "application/json",
         "api-key": FOUNDRY_API_KEY,
     }
     payload = {
+        "model": MODEL_NAME,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_text},
         ],
         # gpt-5-nano es un modelo de razonamiento: usa max_completion_tokens
-        # (incluye reasoning tokens internos + tokens de respuesta).
-        # Con 8000 hay margen suficiente para generar el JSON musical completo.
-        "max_completion_tokens": 8000,
+        # (incluye reasoning tokens internos + tokens de respuesta visibles).
+        # Se reservan ~14 000 tokens para razonamiento y ~2 000 para el JSON.
+        "max_completion_tokens": 16000,
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(
@@ -130,7 +149,19 @@ def call_foundry_for_music_json(user_text: str) -> dict:
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Error de conexión: {e}") from e
 
-    raw_content = resp.json()["choices"][0]["message"]["content"]
+    choice = resp.json()["choices"][0]
+    raw_content   = choice["message"]["content"] or ""
+    finish_reason = choice.get("finish_reason", "")
+
+    # El modelo de razonamiento puede agotar el presupuesto de tokens *antes*
+    # de escribir la respuesta, dejando content vacío con finish_reason="length".
+    if not raw_content.strip():
+        raise RuntimeError(
+            "El modelo no generó contenido (finish_reason="
+            f"'{finish_reason}'). Intenta con una instrucción "
+            "más corta o simplifica la melodía solicitada."
+        )
+
     clean = _clean_model_response(raw_content)
 
     try:
